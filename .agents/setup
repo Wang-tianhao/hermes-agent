@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Install toolchains and lockfile dependencies for Amp orbs.
+# Idempotent: a warm snapshot should skip apt and reuse uv/npm trees.
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+step() {
+  local name="$1"
+  shift
+  local start now
+  start="$(date +%s)"
+  echo "==> $name"
+  "$@"
+  now="$(date +%s)"
+  echo "==> $name done in $((now - start))s"
+}
+
+have_pkg() {
+  dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'
+}
+
+install_apt_if_missing() {
+  local pkg need=()
+  for pkg in "$@"; do
+    if ! have_pkg "$pkg"; then
+      need+=("$pkg")
+    fi
+  done
+  if ((${#need[@]} == 0)); then
+    echo "apt packages already installed: $*"
+    return 0
+  fi
+  sudo apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${need[@]}"
+}
+
+ensure_npm_major() {
+  # JS CI uses npm 12; engines also allow npm 10. Prefer 12 when missing.
+  if npm --version 2>/dev/null | grep -q '^12\.'; then
+    echo "npm $(npm --version) already on PATH"
+    return 0
+  fi
+  npm install -g npm@12
+}
+
+sync_python() {
+  # Same extras as .github/workflows/tests.yml so HERMES_DISABLE_LAZY_INSTALLS
+  # tests have their SDKs already in the venv.
+  uv python install 3.11
+  uv sync --locked --python 3.11 \
+    --extra all --extra dev \
+    --extra anthropic --extra mistral --extra fal \
+    --extra modal --extra daytona --extra hindsight --extra parallel-web
+}
+
+sync_node() {
+  local stamp="node_modules/.amp-setup-lockhash"
+  local lock_hash
+  lock_hash="$(sha256sum package-lock.json | awk '{print $1}')"
+  if [[ -d node_modules && -f "$stamp" && "$(cat "$stamp")" == "$lock_hash" ]]; then
+    echo "npm ci skipped (node_modules matches package-lock.json)"
+    return 0
+  fi
+  npm ci
+  mkdir -p node_modules
+  printf '%s\n' "$lock_hash" >"$stamp"
+}
+
+persist_venv_on_login() {
+  local marker="# hermes-agent orb venv"
+  local profile="$HOME/.bash_profile"
+  touch "$profile"
+  if grep -Fqx "$marker" "$profile" 2>/dev/null; then
+    echo "login-shell venv hook already present"
+    return 0
+  fi
+  cat >>"$profile" <<EOF
+
+$marker
+if [[ -z "\${VIRTUAL_ENV:-}" && "\${PWD}" == "$repo_root" && -f "$repo_root/.venv/bin/activate" ]]; then
+  # shellcheck disable=SC1091
+  source "$repo_root/.venv/bin/activate"
+fi
+EOF
+  echo "appended venv hook to $profile"
+}
+
+write_orb_guidance() {
+  local dest="$HOME/.config/amp/AGENTS.md"
+  local marker="<!-- hermes-agent orb setup -->"
+  mkdir -p "$(dirname "$dest")"
+  if [[ -f "$dest" ]] && grep -Fq "$marker" "$dest"; then
+    echo "orb guidance already present"
+    return 0
+  fi
+  cat >>"$dest" <<'EOF'
+
+<!-- hermes-agent orb setup -->
+# Hermes Agent — orb notes
+
+- Python lives in `.venv` (Python 3.11 via `uv sync --locked`). Activate with `source .venv/bin/activate`.
+- Run tests with `scripts/run_tests.sh`, never bare `pytest`.
+- Node workspaces are installed at the repo root (`npm ci`, Node 26). `website/` is a separate lockfile; install it only when editing docs.
+- Do not write secrets into `.env` during setup. Copy `.env.example` locally if you need a template.
+EOF
+}
+
+step "system packages" install_apt_if_missing git-lfs
+step "npm 12" ensure_npm_major
+step "python venv (uv sync --locked)" sync_python
+step "node workspaces (npm ci)" sync_node
+step "login-shell venv" persist_venv_on_login
+step "orb guidance" write_orb_guidance
+
+echo "setup complete"
+.venv/bin/python -c 'import sys, pytest; print("python", sys.version.split()[0], "pytest", pytest.__version__)'
+node -v
+npm -v
+uv --version

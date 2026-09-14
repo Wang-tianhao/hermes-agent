@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Fast, idempotent orb wake-up. Do not install dependencies here.
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+if [[ -f .venv/bin/activate ]]; then
+  # shellcheck disable=SC1091
+  source .venv/bin/activate
+fi
+
+if [[ ! -x .venv/bin/python ]]; then
+  echo "resume: .venv missing; run .agents/setup" >&2
+  exit 1
+fi
+
+if ! .venv/bin/python -c 'import pytest' >/dev/null 2>&1; then
+  echo "resume: pytest missing from .venv; run .agents/setup" >&2
+  exit 1
+fi
+
+if [[ ! -d node_modules ]]; then
+  echo "resume: node_modules missing; run .agents/setup" >&2
+  exit 1
+fi
+
+echo "resume ok"
